@@ -7,9 +7,9 @@ Spawn a child agent with fresh messages=[]. The child works in its own
 context, sharing the filesystem, then returns only a summary to the parent.
 
     Parent agent                     Subagent
-    +------------------+             +------------------+
-    | messages=[...]   |             | messages=[]      |  <-- fresh
-    |                  |  dispatch   |                  |
+    +------------------+            +------------------+
+    | messages=[...]   |            | messages=[]      |  <-- fresh
+    |                  |  dispatch  |                  |
     | tool: task       | ---------->| while tool_use:  |
     |   prompt="..."   |            |   call tools     |
     |   description="" |            |   append results |
@@ -40,6 +40,8 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+# new system prompt only for sub-agent, which is created for more specific task and running in a isolated context with fresh messages, returning only a compressed summary back to main agent.
+# apparently, it's better for keeping the main agent's context clean.
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
@@ -100,6 +102,7 @@ TOOL_HANDLERS = {
 }
 
 # Child gets all base tools except task (no recursive spawning)
+# all tools are shared by main agent and sub-agent, except `task` tool to avoid recursive spawning.
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -113,9 +116,11 @@ CHILD_TOOLS = [
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
+# almost same as main agent loop, but with a different system prompt and a fresh context (messages)
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    # not a infinite loop, limit to 30 rounds
+    for _ in range(5):  # safety limit
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
@@ -131,10 +136,13 @@ def run_subagent(prompt: str) -> str:
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
     # Only the final text returns to the parent -- child context is discarded
+    # for simplicity, just join all blocks in response together as a 'summary' and discard all conversation history raised by sub-agent.
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
 # -- Parent tools: base tools + task dispatcher --
+# a special tool, which is used to dispatch subtasks to spawned sub-agents.
+# so prompt for sub-agent is required.
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -142,6 +150,7 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    # still the same loop.
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -153,9 +162,12 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # if the model wants to break-down task into multi-steps and dispatch subtasks to sub-agent, it will use `task` tool.
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
+                    # spawning a new sub-agent for task `{desc}`
                     print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                    # get 'summary' from sub-agent
                     output = run_subagent(block.input["prompt"])
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
