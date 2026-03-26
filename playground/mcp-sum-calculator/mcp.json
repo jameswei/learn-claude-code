@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-sum-calculator": {
+      "command": ".venv/bin/python",
+      "args": ["server.py"]
+    }
+  }
+}

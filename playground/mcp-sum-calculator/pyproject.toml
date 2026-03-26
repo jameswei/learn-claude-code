@@ -1,0 +1,13 @@
+[project]
+name = "mcp-sum-calculator"
+version = "0.1.0"
+description = "A simple MCP server with sum calculator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.0.0"]
+
+[project.scripts]
+mcp-sum-calculator = "server:main"
+
+[tool.uv]
+package = true
