@@ -65,13 +65,17 @@ def run_bash(command: str) -> str:
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --
+# here's the entire agent, although it's little bit simplified.
 def agent_loop(messages: list):
+    # loop until the model stops calling tools (tool_use)
     while True:
+        # send messages and tools to the model
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         # Append assistant turn
+        # let user see how the model responds
         messages.append({"role": "assistant", "content": response.content})
         # If the model didn't call a tool, we're done
         if response.stop_reason != "tool_use":
@@ -79,17 +83,23 @@ def agent_loop(messages: list):
         # Execute each tool call, collect results
         results = []
         for block in response.content:
+            # execute tool if model want to use it
             if block.type == "tool_use":
                 print(f"\033[33m$ {block.input['command']}\033[0m")
                 output = run_bash(block.input["command"])
+                # let use see the output
                 print(output[:200])
+                # also append the output to the messages
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
+        # finally, all the outputs are appended as user's input and will be sent to the model again
+        # messages is a accumulating list, each time we append a new user message no matter it's the user query or the tool output, but the model will see the entire history.
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
     history = []
+    # loop until user quits
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
@@ -97,6 +107,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # user's query is the first message
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
