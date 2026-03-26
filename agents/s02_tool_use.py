@@ -37,7 +37,7 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-
+# check if the path is within the workspace to avoid escaping from workspace
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -92,13 +92,23 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- The dispatch map: {tool_name: handler} --
+# add a dict which maps tool name to handler function.
+# in each turn, the model will call the tool by name, and the handler will be execute to fulfill the 'tool_use' request
+# `**kwargs` is used to capture keyword arguments as a dict, then pass it to the handler function by accessing the dict via key(name of the argument)
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
+    # except 'bash', there're new tools registered here for more capabilities
+    # simply add a handler function if you want to add a new tool
+
+    # think about why we add separate 'reader' and 'writer' tools instead of using 'bash'?
+    # you need to execute 'cat' and 'echo' in bash for respectively purpose, however we don't know how many lines should output. Using 'bash' to do this is less secure and restrictive.
+    # separate tools for reading and writing is more secure, like we could do path check or execute in a sandbox.
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
+# tool's schema is required to update to reflect the new tools
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -110,9 +120,11 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
 
-
+# the core loop isn't changed at all
 def agent_loop(messages: list):
+    # same loop like lesson #1
     while True:
+        # more tools means more capabilities but also more token consumption
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -123,7 +135,14 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # when the model wants to use a tool, the input is like:
+                # block.input = {"command": "ls -l"}
+                # block.input = {"path": "foo.txt", "limit": 10}
+                # and block.name indicates which tool the model wants to use, like:
+                # block.name = "read_file"
+                # if there's no matching tool name, handler will be `None`
                 handler = TOOL_HANDLERS.get(block.name)
+                # `**block.input` is a dict unpacking, which will resolve `block.input` as a dict of k-v pairs and pass it to the handler function defined above in `TOOL_HANDLERS`
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"> {block.name}: {output[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})

@@ -50,16 +50,26 @@ TOOLS = [{
     },
 }]
 
-
+# actual execution of 'bash' tool
 def run_bash(command: str) -> str:
+    # dangerous commands are not allowed
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
+        # spawn 出一个 shell 子进程，以当前 path 为 workingdirectory，捕获子进程的 stdout 和 stderr，并设置超时为 120s
+        # 但这种执行 shell 子进程的方式有一些安全风险：
+        # * 子进程权限继承自父进程，如果父进程有 root 权限，子进程也有 root 权限
+        # * 通常以 `run(["ls", "-a"], shell=False)` 的方式执行，避免 shell 注入
+        # * 或者使用 shlex.quote() 来转义
         r = subprocess.run(command, shell=True, cwd=os.getcwd(),
                            capture_output=True, text=True, timeout=120)
+        # 将 stdout 和 stderr 合并，并去除前后空格
         out = (r.stdout + r.stderr).strip()
+        # 如果输出为空，返回 "(no output)"
+        # 如果输出超过 50000 字符，截取前 50000 字符
         return out[:50000] if out else "(no output)"
+    # 如果超时，返回 "Error: Timeout (120s)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
@@ -69,7 +79,7 @@ def run_bash(command: str) -> str:
 def agent_loop(messages: list):
     # loop until the model stops calling tools (tool_use)
     while True:
-        # send messages and tools to the model
+        # send messages and tools (definition or schema) to the model
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
