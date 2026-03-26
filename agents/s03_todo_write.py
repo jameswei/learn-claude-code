@@ -47,19 +47,23 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
 
-
+# key component, which helps the agent to track task with status in a plan
 # -- TodoManager: structured state the LLM writes to --
 class TodoManager:
     def __init__(self):
+        # TodoManager like a task manager, it holds a list of tasks with status.
+        # either in-memory structure, file system, or external storage. that depends on the use case, here for simplicity, we use in-memory implementation.
         self.items = []
 
+    # the cri
     def update(self, items: list) -> str:
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
-        validated = []
+        validated_items = []
         in_progress_count = 0
         for i, item in enumerate(items):
             text = str(item.get("text", "")).strip()
+            # pending is default status
             status = str(item.get("status", "pending")).lower()
             item_id = str(item.get("id", str(i + 1)))
             if not text:
@@ -67,13 +71,19 @@ class TodoManager:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Item {item_id}: invalid status '{status}'")
             if status == "in_progress":
+                # only one task can be in_progress at a time
                 in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
+            validated_items.append({"id": item_id, "text": text, "status": status})
+        # if more than one task is in_progress, raise an error
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
-        self.items = validated
+        self.items = validated_items
+        # get a summarized status of task
+        # the model will leverage this to know the progress and what steps left to do
         return self.render()
 
+    # render all tasks with status in output.
+    # also return to the model
     def render(self) -> str:
         if not self.items:
             return "No todos."
@@ -81,6 +91,7 @@ class TodoManager:
         for item in self.items:
             marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
+        # count the number of completed tasks
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
@@ -155,6 +166,9 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    # a new tool, named 'todo', which maintains a task list and tracks progress on multi-steps task
+    # the model may lose progress on multi-steps task, repeating work, skipping steps, or wandering off.
+    # this might be worse if the conversation get longer and longer, more tool schema take more spaces in context window, and system prompt fades away.
     {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
 ]
@@ -162,11 +176,13 @@ TOOLS = [
 
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
+    # same loop, but with a nag reminder
     rounds_since_todo = 0
     while True:
         # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
+            # tool schema contains the `todo_manager`, which let the model know how to breakdown task into multiple steps and how to track progress
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
@@ -178,14 +194,17 @@ def agent_loop(messages: list):
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
+                    # execute the tool
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
                 print(f"> {block.name}: {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                # indicates if the model uses the `todo_manager`
                 if block.name == "todo":
                     used_todo = True
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        # if not using `todo_manager` for 3 rounds, inject a nag reminder
         if rounds_since_todo >= 3:
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})

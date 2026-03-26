@@ -37,7 +37,7 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-# check if the path is within the workspace to avoid escaping from workspace
+# like a sandbox to ensure the path is within the workspace and avoid escaping
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
