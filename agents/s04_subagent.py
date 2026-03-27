@@ -141,11 +141,10 @@ def run_subagent(prompt: str) -> str:
 
 
 # -- Parent tools: base tools + task dispatcher --
-# a special tool, which is used to dispatch subtasks to spawned sub-agents.
-# so prompt for sub-agent is required.
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+    # a special tool, which is used to dispatch task to spawned sub-agents.
+    # so prompt for sub-agent is required.
+    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.", "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
 ]
 
 

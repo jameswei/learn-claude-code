@@ -43,6 +43,11 @@ its own agent loop in a separate thread. Communication via append-only inboxes.
 Key insight: "Teammates that can talk to each other."
 """
 
+# This is an orchestration pattern which is designed for multiple agents working together. message can be shared through an async 'mailbox' mechanism.
+# Each agent plays as a teammate, if it's not able to finish a task, it can handover to another teammate.
+# Usually, main agent plays as a lead, all others play as workers. Different with sub-agent pattern, a sub-agent will be disposed after a single task and return back the summary. However, teammate agent will not be destroyed, it will be idle util get a new task.
+# data passed through inboxes is in jsonl format, easy to parse and serialize.
+
 import json
 import os
 import subprocess
@@ -60,11 +65,15 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# specify a directory for team configuration
 TEAM_DIR = WORKDIR / ".team"
+# specify a directory for async mailbox
 INBOX_DIR = TEAM_DIR / "inbox"
 
+# system prompt indicates that there're multiple agents working together.
 SYSTEM = f"You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes."
 
+# message bus can deliver only these message types.
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -75,6 +84,8 @@ VALID_MSG_TYPES = {
 
 
 # -- MessageBus: JSONL inbox per teammate --
+# `MessageBus` is an append-only local file in jsonl format.
+# each line is a message as json string.
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -82,8 +93,10 @@ class MessageBus:
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        # only valid message types are allowed
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        # build message structure
         msg = {
             "type": msg_type,
             "from": sender,
@@ -92,11 +105,13 @@ class MessageBus:
         }
         if extra:
             msg.update(extra)
+        # a file contains all received messages
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
 
+    # `read_inbox` reads all messages then clear the file.
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
@@ -108,6 +123,7 @@ class MessageBus:
         inbox_path.write_text("")
         return messages
 
+    # `broadcast` sends a message to all teammates' inboxes
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
         count = 0
         for name in teammates:
@@ -121,10 +137,12 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- TeammateManager: persistent named agents with config.json --
+# `TeammateManager` manages agents via a `config.json`
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
+        # config.json stores the team roster, which maintains each teammate's name, role, and status.
         self.config_path = self.dir / "config.json"
         self.config = self._load_config()
         self.threads = {}
@@ -132,9 +150,11 @@ class TeammateManager:
     def _load_config(self) -> dict:
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
+        # initialize an empty team roster if no config present
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        # save team roster to file if updated
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
@@ -143,8 +163,11 @@ class TeammateManager:
                 return m
         return None
 
+    # `spawn` creates a teammate by given name, role, and prompt (since it's a agent)
+    # then start a thread to run its agent loop.
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
+        # if member exists and ready to work, update its status and role
         if member:
             if member["status"] not in ("idle", "shutdown"):
                 return f"Error: '{name}' is currently {member['status']}"
@@ -153,6 +176,7 @@ class TeammateManager:
         else:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
+        # update team roster
         self._save_config()
         thread = threading.Thread(
             target=self._teammate_loop,
@@ -166,12 +190,15 @@ class TeammateManager:
     def _teammate_loop(self, name: str, role: str, prompt: str):
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
+            # hint teammate to use send_message to communicate.
             f"Use send_message to communicate. Complete your task."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
         for _ in range(50):
+            # only read last 50 messages.
             inbox = BUS.read_inbox(name)
+            # read inbox and inject into message
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
             try:
@@ -179,6 +206,7 @@ class TeammateManager:
                     model=MODEL,
                     system=sys_prompt,
                     messages=messages,
+                    # tools are different with main agent.
                     tools=tools,
                     max_tokens=8000,
                 )
@@ -199,12 +227,13 @@ class TeammateManager:
                     })
             messages.append({"role": "user", "content": results})
         member = self._find_member(name)
+        # update status to idle if finished a task
         if member and member["status"] != "shutdown":
             member["status"] = "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        # these base tools are unchanged from s02, only add `send_message` and `read_inbox`
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -219,6 +248,7 @@ class TeammateManager:
             return json.dumps(BUS.read_inbox(sender), indent=2)
         return f"Unknown tool: {tool_name}"
 
+    # available tools for teammate
     def _teammate_tools(self) -> list:
         # these base tools are unchanged from s02
         return [
@@ -236,6 +266,7 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {}}},
         ]
 
+    # return name, role, and status of each teammate
     def list_all(self) -> str:
         if not self.config["members"]:
             return "No teammates."
@@ -244,6 +275,7 @@ class TeammateManager:
             lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
         return "\n".join(lines)
 
+    # return name list of all teammates
     def member_names(self) -> list:
         return [m["name"] for m in self.config["members"]]
 
