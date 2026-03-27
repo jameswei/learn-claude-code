@@ -38,22 +38,29 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# a dedicate directory for tasks
 TASKS_DIR = WORKDIR / ".tasks"
-
+# system prompt without skills
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
 
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
+# here's a similar structure as the `TodoManager` in sub-agent lesson
+# but `TaskManager` manages tasks as a resolved graph, and persists to local file, which means it can work across multiple agents and context compressions.
+# just like a coordinator, tasks get executed with ordering, parallelism, and dependencies.
+# while `TodoManager` can only maintain a flat list of tasks, no ordering, no dependencies, and only done-or-not status. but in the real world, tasks have prerequisites and dependencies.
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
         self.dir.mkdir(exist_ok=True)
         self._next_id = self._max_id() + 1
 
+    # return max task id
     def _max_id(self) -> int:
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
         return max(ids) if ids else 0
 
+    # read from json file and deserialize to a dict
     def _load(self, task_id: int) -> dict:
         path = self.dir / f"task_{task_id}.json"
         if not path.exists():
@@ -64,26 +71,34 @@ class TaskManager:
         path = self.dir / f"task_{task['id']}.json"
         path.write_text(json.dumps(task, indent=2))
 
+    # create a new task and write to file
     def create(self, subject: str, description: str = "") -> str:
+        # create a task with properties
         task = {
             "id": self._next_id, "subject": subject, "description": description,
             "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
         }
+        # persist to file
         self._save(task)
         self._next_id += 1
         return json.dumps(task, indent=2)
 
+    # simply read a task by given task id
     def get(self, task_id: int) -> str:
         return json.dumps(self._load(task_id), indent=2)
 
+    # update a task by given task id.
     def update(self, task_id: int, status: str = None,
                add_blocked_by: list = None, add_blocks: list = None) -> str:
         task = self._load(task_id)
+        # update status if new status is provided
         if status:
+            # must be valid status
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
             # When a task is completed, remove it from all other tasks' blockedBy
+            # unlock other tasks if they depend on this task
             if status == "completed":
                 self._clear_dependency(task_id)
         if add_blocked_by:
@@ -99,12 +114,16 @@ class TaskManager:
                         self._save(blocked)
                 except ValueError:
                     pass
+        # serialize and write back to file
         self._save(task)
         return json.dumps(task, indent=2)
 
+    # remove self from other tasks' blockedBy list, then write back to file
     def _clear_dependency(self, completed_id: int):
         """Remove completed_id from all other tasks' blockedBy lists."""
         for f in self.dir.glob("task_*.json"):
+            # here's the drawback of managing task by a json file
+            # deserialize from file, modify in memory, then serialize back again
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
                 task["blockedBy"].remove(completed_id)
@@ -181,6 +200,7 @@ TOOL_HANDLERS = {
     "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":  lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":   lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # register new handlers for maintaining tasks
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
     "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
     "task_list":   lambda **kw: TASKS.list_all(),
@@ -196,6 +216,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    # more tools for managing tasks, like create, update, list, get.
     {"name": "task_create", "description": "Create a new task.",
      "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
     {"name": "task_update", "description": "Update a task's status or dependencies.",
@@ -208,6 +229,7 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    # still the same loop
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -219,6 +241,7 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # handle tool calling
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
