@@ -10,7 +10,7 @@ before each LLM call to deliver results.
     +-----------------+        +-----------------+
     | agent loop      |        | task executes   |
     | ...             |        | ...             |
-    | [LLM call] <---+------- | enqueue(result) |
+    | [LLM call] <----+------- | enqueue(result) |
     |  ^drain queue   |        +-----------------+
     +-----------------+
 
@@ -43,20 +43,26 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# in system prompt, there's a hint of using `background_run` for long-running tasks.
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
 # -- BackgroundManager: threaded execution + notification queue --
+# `BackgroundManager` maintains a task list and a result queue, which will be drained before each request to the model.
 class BackgroundManager:
     def __init__(self):
-        self.tasks = {}  # task_id -> {status, result, command}
-        self._notification_queue = []  # completed task results
+        # task_id -> {status, result, command}
+        self.tasks = {}
+        # completed task results
+        self._notification_queue = []
+        # provides thread-safe access to the task list and result queue
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
         """Start a background thread, return task_id immediately."""
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        # create a thread to run in background
         thread = threading.Thread(
             target=self._execute, args=(task_id, command), daemon=True
         )
@@ -66,6 +72,7 @@ class BackgroundManager:
     def _execute(self, task_id: str, command: str):
         """Thread target: run subprocess, capture output, push to queue."""
         try:
+            # spawn a process to execute the command
             r = subprocess.run(
                 command, shell=True, cwd=WORKDIR,
                 capture_output=True, text=True, timeout=300
@@ -78,8 +85,10 @@ class BackgroundManager:
         except Exception as e:
             output = f"Error: {e}"
             status = "error"
+        # update the status and result of task
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
+        # append result to queue
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,
@@ -91,17 +100,21 @@ class BackgroundManager:
     def check(self, task_id: str = None) -> str:
         """Check status of one task or list all."""
         if task_id:
+            # no default value, return None if not a valid `task_id`
             t = self.tasks.get(task_id)
             if not t:
                 return f"Error: Unknown task {task_id}"
             return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
         lines = []
+        # if no `task_id` is provided, check all tasks
         for tid, t in self.tasks.items():
             lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
         return "\n".join(lines) if lines else "No background tasks."
 
+    # return all task results then clear
     def drain_notifications(self) -> list:
         """Return and clear all pending completion notifications."""
+        # lock ensures thread-safe access
         with self._lock:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
@@ -165,6 +178,7 @@ TOOL_HANDLERS = {
     "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # register new handlers for background tasks 
     "background_run":   lambda **kw: BG.run(kw["command"]),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
@@ -178,6 +192,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    # new tools for firing a background task and checking status of background task
     {"name": "background_run", "description": "Run command in background thread. Returns task_id immediately.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
@@ -186,17 +201,22 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    # same loop
     while True:
         # Drain background notifications and inject as system message before LLM call
+        # get all completed task results and inject as **system message**
         notifs = BG.drain_notifications()
         if notifs and messages:
+            # only append `task_id`, `status`, and `result`, ignore `command`
             notif_text = "\n".join(
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
+            # using a tag `<background-results>` to wrap the completed task results
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
             messages.append({"role": "assistant", "content": "Noted background results."})
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
+            # tools include `background_run` and `check_background`
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
