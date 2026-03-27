@@ -52,19 +52,25 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# skills are not present in system prompt in this lesson
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
+# introducing `transcript` concept, which is a file that records the full conversation history.
+# it's one part of a three-layer compression architecture.
+# the context window holds the conversation, each turn generates new messages, context will fill up soon. we need to figure out how to compress the conversation to keep enough space and also not lose any information.
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
-
+# this estimation is just based on practical rules
+# roughly, about 4 English characters per token, and 2 Chinese characters per token.
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
     return len(str(messages)) // 4
 
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
+# `micro_compact` is an implicit and automatic compression that runs in each turn. it shrinks the context window by replacing old tool_result with a simple activity like 'previous: used {tool_name}'.
 def micro_compact(messages: list) -> list:
     # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
     tool_results = []
@@ -73,6 +79,7 @@ def micro_compact(messages: list) -> list:
             for part_idx, part in enumerate(msg["content"]):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
+    # no need to compress
     if len(tool_results) <= KEEP_RECENT:
         return messages
     # Find tool_name for each result by matching tool_use_id in prior assistant messages
@@ -91,20 +98,25 @@ def micro_compact(messages: list) -> list:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
             result["content"] = f"[Previous: used {tool_name}]"
+    # generate a simple activity record in format f'[Previous: used {tool_name}]'
     return messages
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+# `auto_compact` is also an automatic compression that runs only if the token estimation exceeds the given threshold.
 def auto_compact(messages: list) -> list:
     # Save full transcript to disk
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
+        # for each message, serialize it to a json string and write to the file
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     print(f"[transcript saved: {transcript_path}]")
     # Ask LLM to summarize
+    # also let the model to summarize all history message
     conversation_text = json.dumps(messages, default=str)[:80000]
+    # a side call separated with agent loop, no system prompt, no tools, only a simple user request
     response = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content":
@@ -113,10 +125,17 @@ def auto_compact(messages: list) -> list:
             "Be concise but preserve critical details.\n\n" + conversation_text}],
         max_tokens=2000,
     )
-    summary = response.content[0].text
+    for block in response.content:
+        if block.type == "text":
+            summary = block.text
+            break
+
     # Replace all messages with compressed summary
+    # drop existing messages and replace with a summary message, which contains a summary of the full conversation and where it is saved
     return [
+        # where the full conversation saved is an implicit hint for the model.
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        # this is not a real message returned from the model, just to make the conversation complete and ready for the next turn.
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
 
@@ -175,6 +194,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # a new too handler for manual compression, which is explicitly triggered by the model.
     "compact":    lambda **kw: "Manual compression requested.",
 }
 
@@ -187,12 +207,15 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    # introducing a new tool `compact`, which is used to manually trigger conversion compression.
+    # let the model know there's a tool for compression, but actually only a dummy handler is provided as above.
     {"name": "compact", "description": "Trigger manual conversation compression.",
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
 ]
 
 
 def agent_loop(messages: list):
+    # still the same loop
     while True:
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
@@ -211,9 +234,10 @@ def agent_loop(messages: list):
         manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
+                # explicitly call `compact` tool
                 if block.name == "compact":
                     manual_compact = True
-                    output = "Compressing..."
+                    output = "Compressing..." + "\n\n" + "Compresion done."
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     try:
