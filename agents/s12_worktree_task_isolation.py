@@ -6,6 +6,20 @@ s12_worktree_task_isolation.py - Worktree + Task Isolation
 Directory-level isolation for parallel task execution.
 Tasks are the control plane and worktrees are the execution plane.
 
+Control plane (.tasks/)             Execution plane (.worktrees/)
++------------------+                +------------------------+
+| task_1.json      |                | auth-refactor/         |
+|   status: in_progress  <------>   branch: wt/auth-refactor |
+|   worktree: "auth-refactor"       |   task_id: 1           |
++------------------+                +------------------------+
+| task_2.json      |                | ui-login/              |
+|   status: pending    <------>     branch: wt/ui-login      |
+|   worktree: "ui-login"            |   task_id: 2           |
++------------------+                +------------------------+
+                                    |
+                          index.json (worktree registry)
+                          events.jsonl (lifecycle log)
+
     .tasks/task_12.json
       {
         "id": 12,
@@ -29,6 +43,7 @@ Tasks are the control plane and worktrees are the execution plane.
 
 Key insight: "Isolate by directory, coordinate by task ID."
 """
+# by leveraging 'git worktree' capability, we can isolate different tasks no matter parallel execution or not, into different directories. tasks are coordinated by task id.
 
 import json
 import os
@@ -54,12 +69,14 @@ def detect_repo_root(cwd: Path) -> Path | None:
     """Return git repo root if cwd is inside a repo, else None."""
     try:
         r = subprocess.run(
+            # `--show-toplevel` by default show the absolute path of the top-level directory of the working tree, no matter under what path currently.
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=10,
         )
+        # if not in a valid git repo, will get a '128' return code and stdout will be 'fatal: not a git repository (or any of the parent directories): .git'
         if r.returncode != 0:
             return None
         root = Path(r.stdout.strip())
@@ -70,6 +87,7 @@ def detect_repo_root(cwd: Path) -> Path | None:
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
+# system prompt contains hint which lead the model to use task and worktree tools, and also tips on how to use.
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Use task + worktree tools for multi-task work. "
@@ -80,6 +98,8 @@ SYSTEM = (
 
 
 # -- EventBus: append-only lifecycle events for observability --
+# `EventBus` is similar with `MessageBus` in s09_agent_teams.py, both are append-only local file in jsonl format.
+# an `EventBus` is binding with a worktree.
 class EventBus:
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -87,6 +107,8 @@ class EventBus:
         if not self.path.exists():
             self.path.write_text("")
 
+    # `emit` build an event and write in event log file.
+    # only called by `WorktreeManager` when creating and removing worktree.
     def emit(
         self,
         event: str,
@@ -94,19 +116,23 @@ class EventBus:
         worktree: dict | None = None,
         error: str | None = None,
     ):
+        # build event payload with event name, timestamp, task and worktree data.
         payload = {
             "event": event,
             "ts": time.time(),
             "task": task or {},
             "worktree": worktree or {},
         }
+        # inject error if present
         if error:
             payload["error"] = error
         with self.path.open("a", encoding="utf-8") as f:
+            # write in jsonl format
             f.write(json.dumps(payload) + "\n")
 
+    # read recent `n` events, where 1 <= n <= 200
     def list_recent(self, limit: int = 20) -> str:
-        n = max(1, min(int(limit or 20), 200))
+        n = max(1, min(limit, 200))
         lines = self.path.read_text(encoding="utf-8").splitlines()
         recent = lines[-n:]
         items = []
@@ -119,6 +145,7 @@ class EventBus:
 
 
 # -- TaskManager: persistent task board with optional worktree binding --
+# similar with `TaskManager` in s07_task_system.py, but binding worktree to task.
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -127,6 +154,9 @@ class TaskManager:
 
     def _max_id(self) -> int:
         ids = []
+        # scan all task files everytime to get the max id only at 2 scenarios:
+        # 1. first time to initialize `TaskManager`
+        # 2. restore from crash/restart
         for f in self.dir.glob("task_*.json"):
             try:
                 ids.append(int(f.stem.split("_")[1]))
@@ -143,10 +173,12 @@ class TaskManager:
             raise ValueError(f"Task {task_id} not found")
         return json.loads(path.read_text())
 
+    # each task is a json object serialized into a local file named `task_{task_id}.json`.
     def _save(self, task: dict):
         self._path(task["id"]).write_text(json.dumps(task, indent=2))
 
     def create(self, subject: str, description: str = "") -> str:
+        # create a task with some properties
         task = {
             "id": self._next_id,
             "subject": subject,
@@ -168,6 +200,7 @@ class TaskManager:
     def exists(self, task_id: int) -> bool:
         return self._path(task_id).exists()
 
+    # update task status or owner
     def update(self, task_id: int, status: str = None, owner: str = None) -> str:
         task = self._load(task_id)
         if status:
@@ -180,17 +213,20 @@ class TaskManager:
         self._save(task)
         return json.dumps(task, indent=2)
 
-    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+    # bind a worktree to a task, normally means the task is going to be worked on.
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = None) -> str:
         task = self._load(task_id)
         task["worktree"] = worktree
         if owner:
             task["owner"] = owner
+        # if task is pending, set it to in_progress, which means the given `task_id` is going to be worked on.
         if task["status"] == "pending":
             task["status"] = "in_progress"
         task["updated_at"] = time.time()
         self._save(task)
         return json.dumps(task, indent=2)
 
+    # unbind a worktree from a task, normally means the task is already completed.
     def unbind_worktree(self, task_id: int) -> str:
         task = self._load(task_id)
         task["worktree"] = ""
@@ -222,6 +258,7 @@ EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 
 # -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
+# `WorktreeManager` maintains the index of all worktrees, and the lifecycle of each worktree.
 class WorktreeManager:
     def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
         self.repo_root = repo_root
@@ -247,10 +284,13 @@ class WorktreeManager:
         except Exception:
             return False
 
+    # execute git command in a sub-process
     def _run_git(self, args: list[str]) -> str:
         if not self.git_available:
             raise RuntimeError("Not in a git repository. worktree tools require git.")
         r = subprocess.run(
+            # no matter what args is passed in, pass to subprocess as a list of strings (unpacking `*args`).
+            # may be insecure
             ["git", *args],
             cwd=self.repo_root,
             capture_output=True,
@@ -270,6 +310,8 @@ class WorktreeManager:
 
     def _find(self, name: str) -> dict | None:
         idx = self._load_index()
+        # scan all worktrees in index to find given worktree name.
+        # why not maintain worktrees in a map?
         for wt in idx.get("worktrees", []):
             if wt.get("name") == name:
                 return wt
@@ -281,15 +323,21 @@ class WorktreeManager:
                 "Invalid worktree name. Use 1-40 chars: letters, numbers, ., _, -"
             )
 
+    # task_id is optional, a worktree is required if `task_id` is provided
+    # `base_ref` is the branch to checkout, default is 'HEAD'
     def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+        # ensure worktree name is valid and not duplicated.
         self._validate_name(name)
         if self._find(name):
             raise ValueError(f"Worktree '{name}' already exists in index")
+        # ensure worktree is bound to a task, which makes parallel execution works in isolated workspace no collision.
         if task_id is not None and not self.tasks.exists(task_id):
             raise ValueError(f"Task {task_id} not found")
 
         path = self.dir / name
+        # branch name follows f'wt/{workstree_name}' pattern
         branch = f"wt/{name}"
+        # emit a event before worktree was created
         self.events.emit(
             "worktree.create.before",
             task={"id": task_id} if task_id is not None else {},
@@ -298,6 +346,7 @@ class WorktreeManager:
         try:
             self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
 
+            # create an index entry for the new worktree
             entry = {
                 "name": name,
                 "path": str(path),
@@ -309,11 +358,14 @@ class WorktreeManager:
 
             idx = self._load_index()
             idx["worktrees"].append(entry)
+            # save the index to file
             self._save_index(idx)
 
+            # bind the worktree to the task if task_id is provided
             if task_id is not None:
                 self.tasks.bind_worktree(task_id, name)
 
+            # emit a event after worktree was created
             self.events.emit(
                 "worktree.create.after",
                 task={"id": task_id} if task_id is not None else {},
@@ -334,6 +386,7 @@ class WorktreeManager:
             )
             raise
 
+    # list all worktrees in index
     def list_all(self) -> str:
         idx = self._load_index()
         wts = idx.get("worktrees", [])
@@ -365,6 +418,8 @@ class WorktreeManager:
         text = (r.stdout + r.stderr).strip()
         return text or "Clean worktree"
 
+    # this function works as the tool_use `worktree_run` handler.
+    # run command within the worktree directory.
     def run(self, name: str, command: str) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
@@ -538,17 +593,20 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # tools for maintaining tasks, similar with s07_task_system.py
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
     "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner")),
     "task_bind_worktree": lambda **kw: TASKS.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
+    # tools for maintaining worktrees
     "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
     "worktree_list": lambda **kw: WORKTREES.list_all(),
     "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
     "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
     "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
     "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
+    # tool for retrieving worktree events
     "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
 }
 
@@ -739,6 +797,7 @@ def agent_loop(messages: list):
         if response.stop_reason != "tool_use":
             return
 
+        # same flow, handle tool_use loop
         results = []
         for block in response.content:
             if block.type == "tool_use":
