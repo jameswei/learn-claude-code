@@ -47,15 +47,18 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
 
-# key component, which helps the agent to track task with status in a plan
 # -- TodoManager: structured state the LLM writes to --
+# key component, which helps the agent to track task with status in a plan
+# `TodoManager` is designed for **extracting a visible and trackable plan out of the model's chain-of-thought before any action was taken.**
+# the model's chain-of-thought reflects how the model reason the user's input and break-down it into multiple steps. however:
+# it's empheral within the model's memory, not persistent. As long as the steps move forward, plan may get squeezed out of context window, the model may lose the progress. an external and persistent plan makes progress trackable and a reliable task completion.
 class TodoManager:
     def __init__(self):
-        # TodoManager like a task manager, it holds a list of tasks with status.
+        # `TodoManager` is like a task manager in common OS, it holds a list of tasks with status.
         # either in-memory structure, file system, or external storage. that depends on the use case, here for simplicity, we use in-memory implementation.
         self.items = []
 
-    # the cri
+    # `update` tasks status to make it a visible and trackable plan.
     def update(self, items: list) -> str:
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")

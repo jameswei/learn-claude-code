@@ -43,29 +43,30 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# in system prompt, there's a hint of using `background_run` for long-running tasks.
+# in system prompt, there's **a hint of using `background_run` for long-running tasks.**
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
 # -- BackgroundManager: threaded execution + notification queue --
-# `BackgroundManager` maintains a task list and a result queue, which will be drained before each request to the model.
+# `BackgroundManager` maintains a task list and a result queue, which will be drained before making each request to the model.
 class BackgroundManager:
     def __init__(self):
         # task_id -> {status, result, command}
         self.tasks = {}
         # completed task results
         self._notification_queue = []
-        # provides thread-safe access to the task list and result queue
+        # provides thread-safe access to result queue
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
         """Start a background thread, return task_id immediately."""
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
-        # create a thread to run in background
+        # create a thread to run in background, actually spawning a subprocess.
         thread = threading.Thread(
             target=self._execute, args=(task_id, command), daemon=True
         )
+        # doesn't block the main thread, returns immediately.
         thread.start()
         return f"Background task {task_id} started: {command[:80]}"
 
@@ -88,7 +89,7 @@ class BackgroundManager:
         # update the status and result of task
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
-        # append result to queue
+        # append result to notification_queue
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,

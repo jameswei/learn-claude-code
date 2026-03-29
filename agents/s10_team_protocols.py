@@ -10,18 +10,18 @@ request_id correlation pattern. Builds on s09's team messaging.
 
     Lead                              Teammate
     +---------------------+          +---------------------+
-    | shutdown_request     |          |                     |
-    | {                    | -------> | receives request    |
-    |   request_id: abc    |          | decides: approve?   |
-    | }                    |          |                     |
+    | shutdown_request    |          |                     |
+    | {                   | -------> | receives request    |
+    |   request_id: abc   |          | decides: approve?   |
+    | }                   |          |                     |
     +---------------------+          +---------------------+
                                              |
     +---------------------+          +-------v-------------+
-    | shutdown_response    | <------- | shutdown_response   |
-    | {                    |          | {                   |
-    |   request_id: abc    |          |   request_id: abc   |
-    |   approve: true      |          |   approve: true     |
-    | }                    |          | }                   |
+    | shutdown_response   | <------- | shutdown_response   |
+    | {                   |          | {                   |
+    |   request_id: abc   |          |   request_id: abc   |
+    |   approve: true     |          |   approve: true     |
+    | }                   |          | }                   |
     +---------------------+          +---------------------+
             |
             v
@@ -31,21 +31,22 @@ request_id correlation pattern. Builds on s09's team messaging.
 
     Teammate                          Lead
     +---------------------+          +---------------------+
-    | plan_approval        |          |                     |
+    | plan_approval       |          |                     |
     | submit: {plan:"..."}| -------> | reviews plan text   |
     +---------------------+          | approve/reject?     |
                                      +---------------------+
                                              |
     +---------------------+          +-------v-------------+
-    | plan_approval_resp   | <------- | plan_approval       |
-    | {approve: true}      |          | review: {req_id,    |
-    +---------------------+          |   approve: true}     |
+    | plan_approval_resp  | <------- | plan_approval       |
+    | {approve: true}     |          | review: {req_id,    |
+    +---------------------+          |   approve: true}    |
                                      +---------------------+
 
     Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
 
 Key insight: "Same request_id correlation pattern, two domains."
 """
+# req-resp with correlation id is a common pattern in agents collabration.
 
 import json
 import os
@@ -68,6 +69,7 @@ MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
+# hint in system prompt to manage teammates with `shutdown_response` and `plan_approval` protocols.
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
 VALID_MSG_TYPES = {
@@ -79,12 +81,17 @@ VALID_MSG_TYPES = {
 }
 
 # -- Request trackers: correlate by request_id --
+# an in-memory dict stores all sent `shutdown_request`
 shutdown_requests = {}
+# an in-memory dict stores all 
 plan_requests = {}
+# global lock for thread-safe
 _tracker_lock = threading.Lock()
 
 
 # -- MessageBus: JSONL inbox per teammate --
+# `MessageBus` is an append-only local file in jsonl format. each line is a message as json string.
+# each agent has its own inbox, messages from others are appended to the inbox file
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -94,6 +101,7 @@ class MessageBus:
              msg_type: str = "message", extra: dict = None) -> str:
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        # build message structure with type, from, content, and timestamp
         msg = {
             "type": msg_type,
             "from": sender,
@@ -103,6 +111,7 @@ class MessageBus:
         if extra:
             msg.update(extra)
         inbox_path = self.dir / f"{to}.jsonl"
+        # append to the inbox file of `to`
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
@@ -112,6 +121,7 @@ class MessageBus:
         if not inbox_path.exists():
             return []
         messages = []
+        # read all messages then clear the inbox
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))
@@ -120,6 +130,7 @@ class MessageBus:
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
         count = 0
+        # write to all others' inboxes
         for name in teammates:
             if name != sender:
                 self.send(sender, name, content, "broadcast")
@@ -131,6 +142,7 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- TeammateManager with shutdown + plan approval --
+# `TeammateManager` manages agents via a `config.json`, which stores the team roster.
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -182,7 +194,9 @@ class TeammateManager:
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
         should_exit = False
+        # at most 50 turns
         for _ in range(50):
+            # read all messages from inbox, may contain `shutdown_request`
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
@@ -211,11 +225,15 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # if the model uses `shutdown_response` tool, and approves the shutdown, set `should_exit` to True
                     if block.name == "shutdown_response" and block.input.get("approve"):
+                        # this flag ensures the teammate exit the loop in next turn and shutdown gracefully.
                         should_exit = True
             messages.append({"role": "user", "content": results})
         member = self._find_member(name)
         if member:
+            # either normally exit the loop or be asked to shutdown
+            # update status to 'idle' or 'shutdown'
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
@@ -233,22 +251,28 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+        # handle `shutdown_request`
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             approve = args["approve"]
             with _tracker_lock:
                 if req_id in shutdown_requests:
+                    # update `shutdown_request` status to `approved` or `rejected`
                     shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            # notify lead agent
             BUS.send(
                 sender, "lead", args.get("reason", ""),
                 "shutdown_response", {"request_id": req_id, "approve": approve},
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
+        # handle `plan_approval`
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
             with _tracker_lock:
+                # build a `plan_approval` request with `from`, `plan`, and `status`
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            # only send to lead agent
             BUS.send(
                 sender, "lead", plan_text, "plan_approval_response",
                 {"request_id": req_id, "plan": plan_text},
@@ -348,17 +372,22 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- Lead-specific protocol handlers --
+# only lead agent is able to raise to `shutdown_request`.
 def handle_shutdown_request(teammate: str) -> str:
+    # "550e8400-e29b-41d4-a716-446655440000" -> "550e8400"
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
+        # a `shutdown_request` is a dict with `target` and `status`
+        # `req_id` is the unique identity
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    # send shutdown request to the given teammate
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
     )
     return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
 
-
+# only lead agent is able to handle `plan_approval`.
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
     with _tracker_lock:
         req = plan_requests.get(request_id)

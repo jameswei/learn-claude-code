@@ -51,9 +51,17 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# where all skills are stored, each skill is structured as a directory with a `SKILL.md` file, which must follow a specific format like below:
+# 1. a YAML frontmatter, which defines the skill's name and a short description about what it can do.
+# 2. a MARKDOWN body, which contains the detailed description and usage instructions.
+# skill, not like tools, only compact and summarized information are present in system prompt, then gradually load the full content into `tool_result` when needed. this approach consumes less tokens than bunch of tools schemas.
+# for example, user asks to set up a new project with typescript and vue, which requires framework-specific knowledge.
+# the model will try to load corresponding skills, like 'typescript.SKILL.md' and 'vue.SKILL.md'.
+# then content will be injected as tool_result, next using skill-provided knowledge to set up the project.
+
 SKILLS_DIR = WORKDIR / "skills"
 
-# skill-loading follows a 2 layer architecture, in layer 1 only compact and summarized skill descriptions are always present. in layer 2, skills' full instructions are loaded on demand through tool_result.
+# skill-loading follows a 2 layer architecture, in layer 1 only compact and summarized skill descriptions are injected into system prompt. while in layer 2, skills' full instructions are loaded on demand through tool_result.
 
 # -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
@@ -113,7 +121,7 @@ class SkillLoader:
         return "\n".join(lines)
 
     def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
+        """Layer 2: full skill body returned in `tool_result`."""
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
@@ -128,7 +136,6 @@ SKILL_LOADER = SkillLoader(SKILLS_DIR)
 # each skill is a one-line summary with name and description.
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
-
 Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 
@@ -188,7 +195,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    # `load_skill` returns the skill content, which then is injected into tool_result. the model will see in context and follow the instruction precisely, no any prompt explosion.
+    # `load_skill` returns the skill full content, which then is injected into `tool_result`. the model will see in context and follow the instruction precisely, no any prompt explosion.
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
@@ -201,7 +208,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    # a standard tool `load_skill`, which is used to load specialized knowledge by name.
+    # `load_skill` as a standard tool, which is used to load specialized knowledge by name.
     {"name": "load_skill", "description": "Load specialized knowledge by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]

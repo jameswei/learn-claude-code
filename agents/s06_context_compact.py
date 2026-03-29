@@ -52,7 +52,7 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# skills are not present in system prompt in this lesson
+# skills are not present in system prompt in this lesson, only hint about using tools is present.
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
 # introducing `transcript` concept, which is a file that records the full conversation history.
@@ -70,7 +70,8 @@ def estimate_tokens(messages: list) -> int:
 
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
-# `micro_compact` is an implicit and automatic compression that runs in each turn. it shrinks the context window by replacing old tool_result with a simple activity like 'previous: used {tool_name}'.
+# usually, `tool_results` are the largest blocks, for example, file contents, command outputs, search results, etc. each one typically is thousands of tokens. `micro-compact` targets these first.
+# `micro_compact` is an implicit and automatic compression that runs in each turn. it shrinks the context window by replacing **old tool_results** with short summaries like 'previous: used {tool_name}'.
 def micro_compact(messages: list) -> list:
     # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
     tool_results = []
@@ -103,7 +104,7 @@ def micro_compact(messages: list) -> list:
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
-# `auto_compact` is also an automatic compression that runs only if the token estimation exceeds the given threshold.
+# `auto_compact` is also an automatic compression that runs only if the token consumption exceeds the given threshold.
 def auto_compact(messages: list) -> list:
     # Save full transcript to disk
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
@@ -234,7 +235,7 @@ def agent_loop(messages: list):
         manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
-                # explicitly call `compact` tool
+                # explicitly call `compact` tool, which triggers a deepest compression.
                 if block.name == "compact":
                     manual_compact = True
                     output = "Compressing..." + "\n\n" + "Compresion done."
@@ -247,7 +248,7 @@ def agent_loop(messages: list):
                 print(f"> {block.name}: {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
-        # Layer 3: manual compact triggered by the compact tool
+        # Layer 3: manual compact triggered by the calling `compact` tool.
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)

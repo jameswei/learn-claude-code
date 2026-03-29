@@ -49,6 +49,7 @@ SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track
 # but `TaskManager` manages tasks as a resolved graph, and persists to local file, which means it can work across multiple agents and context compressions.
 # just like a coordinator, tasks get executed with ordering, parallelism, and dependencies.
 # while `TodoManager` can only maintain a flat list of tasks, no ordering, no dependencies, and only done-or-not status. but in the real world, tasks have prerequisites and dependencies.
+# each task is a JSON file persisted in `.tasks/` directory.
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir

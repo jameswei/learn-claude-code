@@ -22,6 +22,8 @@ context, sharing the filesystem, then returns only a summary to the parent.
 
 Key insight: "Process isolation gives context isolation for free."
 """
+# an agent is running as a process, which is isolated from other processes.
+# a complext task, is suitable for delegation, which can be achieved by spawning a sub-agent, also gives context isolation naturally.
 
 import os
 import subprocess
@@ -40,8 +42,8 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-# new system prompt only for sub-agent, which is created for more specific task and running in a isolated context with fresh messages, returning only a compressed summary back to main agent.
-# apparently, it's better for keeping the main agent's context clean.
+# new system prompt only for sub-agent, which is created for more specific task and running in an isolated context with fresh messages, **returning only a compressed summary back to main agent.**
+# apparently, it's better for keeping the main agent's context clean and without context bloat.
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 

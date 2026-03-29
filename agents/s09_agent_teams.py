@@ -43,10 +43,15 @@ its own agent loop in a separate thread. Communication via append-only inboxes.
 Key insight: "Teammates that can talk to each other."
 """
 
-# This is an orchestration pattern which is designed for multiple agents working together. message can be shared through an async 'mailbox' mechanism.
+# multiple agents collaboration must have:
+# 1. persistent agent across multiple conversations.
+# 2. agent identity and lifecycle management.
+# 3. communication between multiple agents.
+
+# This orchestration pattern achieves all above.
 # Each agent plays as a teammate, if it's not able to finish a task, it can handover to another teammate.
-# Usually, main agent plays as a lead, all others play as workers. Different with sub-agent pattern, a sub-agent will be disposed after a single task and return back the summary. However, teammate agent will not be destroyed, it will be idle util get a new task.
-# data passed through inboxes is in jsonl format, easy to parse and serialize.
+# Usually, main agent plays as a lead, all others play as workers. Different with sub-agent pattern, a sub-agent will **be destroyed after a single task and return back the summary**. However, teammate agent is persistent, be idle until it gets a new task.
+# messages are passed through async 'mailbox' mechanism in jsonl format, easy to parse and serialize.
 
 import json
 import os
@@ -84,13 +89,14 @@ VALID_MSG_TYPES = {
 
 
 # -- MessageBus: JSONL inbox per teammate --
-# `MessageBus` is an append-only local file in jsonl format.
-# each line is a message as json string.
+# `MessageBus` is an append-only local file in jsonl format. each line is a message as json string.
+# the file-based coordination shares nothing and without locks, which makes it simple and robust.
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
+    # `send` actually appends a message to the inbox file.
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
         # only valid message types are allowed
@@ -112,14 +118,17 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     # `read_inbox` reads all messages then clear the file.
+    # teammates poll their inboxes before each request to the model.
     def read_inbox(self, name: str) -> list:
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
         messages = []
+        # read all messages out
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))
+        # clear the file
         inbox_path.write_text("")
         return messages
 
@@ -137,7 +146,7 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- TeammateManager: persistent named agents with config.json --
-# `TeammateManager` manages agents via a `config.json`
+# `TeammateManager` manages agents via a `config.json`, which stores the team roster.
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -163,7 +172,7 @@ class TeammateManager:
                 return m
         return None
 
-    # `spawn` creates a teammate by given name, role, and prompt (since it's a agent)
+    # `spawn` creates a teammate by given name, role, and prompt (since it's an agent)
     # then start a thread to run its agent loop.
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
@@ -195,8 +204,8 @@ class TeammateManager:
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
+        # runs in its own thread (loop) independently, and at most 50 turns, no infinite loop.
         for _ in range(50):
-            # only read last 50 messages.
             inbox = BUS.read_inbox(name)
             # read inbox and inject into message
             for msg in inbox:
