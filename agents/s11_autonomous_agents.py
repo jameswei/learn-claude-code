@@ -34,6 +34,9 @@ identity re-injection after context compression. Builds on s10's protocols.
 
 Key insight: "The agent finds work itself."
 """
+# there's a FSM to manage agent's lifecycle and workflow.
+# an agent scan the tasks and claim tasks itself, moving from 'IDLE' to 'WORKING' status and back if task completed.
+# this is an autonomous agent pattern without coordinator. 'identity rejection' is crucial since agent may lose its identity after context compression.
 
 import json
 import os
@@ -53,15 +56,20 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# manages team roster
 TEAM_DIR = WORKDIR / ".team"
+# manages inbox and messages
 INBOX_DIR = TEAM_DIR / "inbox"
+# manages tasks
 TASKS_DIR = WORKDIR / ".tasks"
 
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
+# system prompt for main agent, also a hint which lets the model know other teammates are autonomous.
 SYSTEM = f"You are a team lead at {WORKDIR}. Teammates are autonomous -- they find work themselves."
 
+# allowed message types
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -73,7 +81,9 @@ VALID_MSG_TYPES = {
 # -- Request trackers --
 shutdown_requests = {}
 plan_requests = {}
+# only used by main agent to track `shutdown_request` and `plan_approval` requests.
 _tracker_lock = threading.Lock()
+# tasks are claimed by agents themselves, we need a lock to avoid race condition.
 _claim_lock = threading.Lock()
 
 
@@ -124,6 +134,7 @@ BUS = MessageBus(INBOX_DIR)
 
 
 # -- Task board scanning --
+# scan and return all unclaimed tasks
 def scan_unclaimed_tasks() -> list:
     TASKS_DIR.mkdir(exist_ok=True)
     unclaimed = []
@@ -135,15 +146,18 @@ def scan_unclaimed_tasks() -> list:
             unclaimed.append(task)
     return unclaimed
 
-
+# `owner` claims a given task by `task_id`
 def claim_task(task_id: int, owner: str) -> str:
+    # accquire a lock to avoid race condition
     with _claim_lock:
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
             return f"Error: Task {task_id} not found"
         task = json.loads(path.read_text())
+        # claim the owner
         task["owner"] = owner
         task["status"] = "in_progress"
+        # write back to the file
         path.write_text(json.dumps(task, indent=2))
     return f"Claimed task #{task_id} for {owner}"
 
@@ -152,6 +166,7 @@ def claim_task(task_id: int, owner: str) -> str:
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
     return {
         "role": "user",
+        # use a tag `<identity>` to highlight the identity and also hint to continue working on other unclaimed tasks.
         "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
     }
 
@@ -475,6 +490,7 @@ TOOL_HANDLERS = {
 }
 
 # these base tools are unchanged from s02
+# bunch of tools consume much token
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -515,6 +531,7 @@ def agent_loop(messages: list):
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
+            # if inbox was not empty, append a fake message to make the conversation complete and ready for next turn. this is common pattern in building agent.
             messages.append({
                 "role": "assistant",
                 "content": "Noted inbox messages.",
